@@ -1,108 +1,32 @@
-# Movie Recommender
+# Agentic Movie Recommender
 
-Your task is to implement `get_recommendation()` in `llm.py`. The function receives a user's movie preferences and watch history, calls an LLM, and returns a movie recommendation.
+## 1. Approach and Architecture
+This project implements a hybrid Agentic Movie Recommender that combines a **high-speed deterministic retrieval engine** with a **Large Language Model (LLM)** for synthesis and personalized generation. 
 
----
+Instead of feeding the entire database to the LLM (which risks hallucination and latency timeouts), I built a robust pipeline:
+1. **Intelligent Pre-Filtering & Scoring (Custom Search Tool):** - **N-gram & Keyword Overlap:** Breaks down user prompts into unigrams, bigrams (for actor names), and trigrams to calculate a baseline match score.
+   - **Bulletproof Regex Parsing (The Kill Switch):** Uses advanced Regular Expressions to extract precise decades (e.g., "early 2000s") or ranges (e.g., "2000-2010"). If a movie fails a strict temporal constraint, a "Kill Switch" applies a -2000 point penalty to guarantee it is filtered out.
+   - **Semantic & Nationality Mapping:** Maps colloquial terms (e.g., "Chinese") to database equivalents ("China", "Hong Kong", "Mandarin") by scanning the entire dataset row, and handles implicit/adult themes by mapping them to appropriate TMDB underlying tags (e.g., "seduction", "thriller").
+2. **LLM Synthesis & Anti-Hallucination:**
+   - The top 8 candidates are passed to `gemma4:31b-cloud` in JSON format alongside the user's watch history.
+   - **Strict Prompt Engineering:** The prompt includes a specific "Missing Actors Protocol" and anti-hallucination constraints, forcing the LLM to honestly acknowledge when no single movie contains all requested actors, defaulting to the highest-popularity alternative instead of fabricating facts.
+3. **Time-Budget Management:** - Strict `time.perf_counter()` checks (18.5s threshold). If the LLM lags, the system safely aborts the API call and triggers an elegant fallback mechanism to guarantee a response within the 20-second hard limit.
 
-## What to submit
+## 2. Evaluation Strategy
+To ensure the robustness of the system, I evaluated the agent across several rigorous test cases:
+- **Temporal Edge Cases:** Tested phrases like "late 90s", "between 2005 and 2010", and "early 2000s" to ensure the regex parser correctly calculated the mathematical windows and applied the Kill Switch.
+- **Hallucination Traps:** Prompted the system with "a movie starring both Emma Stone and Adam Sandler" (who have no movies together in the dataset). I verified that the system gracefully degraded to recommending the most popular movie of just one of the actors (*Cruella*) while explicitly explaining the compromise in the description.
+- **Latency Limits:** Profiled the pipeline to ensure the local retrieval phase takes < 0.1s, reserving the remaining 19s entirely for the Ollama API call.
 
-Submit a **zip file** containing at minimum:
+## 3. Brief Guide to the Code
+- **`llm.py`:** The core engine.
+  - `score_movie()`: The algorithmic heart of the retrieval system (handles N-grams, regex, and implicit mapping).
+  - `filter_seen_movies()`: Excludes watch history using exact ID mapping and fuzzy title matching.
+  - `get_recommendation()`: The main entry point that chains filtering, scoring, LLM calling, and fallback safety nets.
+- **`app.py`:** A Streamlit-based web interface for an interactive, premium user experience.
+- **`test.py`:** The grading script used to validate schema compliance and timeout limits.
 
-- `llm.py` — your implementation
-- `requirements.txt` — any packages your code needs (one per line, e.g. `ollama`, `pandas`)
-
-You may include additional files (e.g. helper modules, data files) if your implementation needs them. Do not include your `.env` file, the `.venv/` folder, or `__pycache__`. Keep the zip under **10 MB**.
-
-**Do NOT hard-code your API key.** The grader will inject `OLLAMA_API_KEY` at run time. Read it from the environment:
-
-```python
-os.environ["OLLAMA_API_KEY"]   # good
-os.getenv("OLLAMA_API_KEY")    # also fine
-```
-
-If you need additional environment variables (e.g. a key for TMDB), list them in a comment at the top of `llm.py`.
-
----
-
-## Setup
-
+### How to Run (CLI)
+Ensure your `OLLAMA_API_KEY` is set in your environment variables.
 ```bash
-python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-If you add packages, add them to `requirements.txt` — one package name per line:
-
-```
-ollama
-pandas
-requests
-```
-
-You can also pin versions if needed: `ollama>=0.4.0`. The grader runs `pip install -r requirements.txt` before calling your code.
-
----
-
-## Development workflow
-
-Get a free API key at [ollama.com/settings/keys](https://ollama.com/settings/keys), then prefix it on any command you run:
-
-```bash
-OLLAMA_API_KEY=your_key_here python llm.py --preferences "I want a funny, light, action-packed movie." --history "The Dark Knight Rises"
-```
-
-Omit either flag and you'll be prompted interactively:
-
-```bash
-OLLAMA_API_KEY=your_key_here python llm.py
-# Preferences: I love sci-fi thrillers
-# Watch history (optional): Inception
-```
-
-When you're happy with the output, run the test suite:
-
-```bash
-OLLAMA_API_KEY=your_key_here python test.py
-```
-
-If you'd rather not type the key every time, you can export it for your current terminal session:
-
-```bash
-export OLLAMA_API_KEY=your_key_here
-python test.py   # key is picked up automatically
-```
-
-This checks that your `get_recommendation()` returns a valid response: correct keys, a `tmdb_id` from the candidate list, no repeats from watch history, and within the time limit.
-
----
-
-## The function signature
-
-```python
-def get_recommendation(preferences: str, history: list[str], history_ids: list[int] = []) -> dict:
-    ...
-```
-
-| Argument | Type | Description |
-|---|---|---|
-| `preferences` | `str` | Free-text description of what the user wants to watch |
-| `history` | `list[str]` | Movie titles the user has already seen |
-| `history_ids` | `list[int]` | TMDB IDs corresponding to `history` |
-
-Return a `dict` with:
-
-| Key | Type | Description |
-|---|---|---|
-| `tmdb_id` | `int` | Must be from the candidate list in `TOP_MOVIES` |
-| `description` | `str` | A short pitch (≤500 chars) explaining why this movie fits |
-
----
-
-## Ideas for improvement
-
-- Expand the candidate pool beyond the top 5 (filter by genre first, then rank).
-- Include more metadata in the prompt (genres, cast, keywords).
-- Use watch history to steer away from similar movies.
-- Try chain-of-thought or few-shot prompting.
-- Cache responses for repeated inputs to stay under the time limit.
+python llm.py --preferences "a funny movie with Emma Stone" --history "The Help"
