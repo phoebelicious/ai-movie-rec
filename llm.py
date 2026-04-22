@@ -198,6 +198,7 @@ def get_client():
     return ollama.Client(
         host="https://ollama.com",
         headers={"Authorization": f"Bearer {api_key}"},
+        timeout=15.0  
     )
 
 
@@ -628,6 +629,19 @@ def score_movie(signals: dict, row) -> float:
     # The popularity acts as a perfect tie-breaker. If Emma and Adam both get +80, 
     # Cruella's higher popularity will make it rank higher than Hotel Transylvania!
     score += popularity * 0.01
+
+    # ==========================================
+    # 5. Base Weights & Popularity Cap (CRITICAL FIX)
+    # ==========================================
+    vote = float(row.get("vote_average", 0.0)) if pd.notna(row.get("vote_average")) else 0.0
+    popularity = float(row.get("popularity", 0.0)) if pd.notna(row.get("popularity")) else 0.0
+    
+    score += vote * 0.5
+    
+    # [CRITICAL FIX]: Cap the popularity bonus to a maximum of 1.5 points.
+    # This prevents extremely viral movies (popularity > 1000) from dominating 
+    # the search results, ensuring the user's prompt remains the primary driver.
+    score += min(popularity * 0.001, 1.5)
     
     return score
 
@@ -700,11 +714,13 @@ Candidate movies (ordered by best match and popularity):
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             format="json",
+            options={"num_predict": 85}  
         )
         parsed = extract_json_object(response.message.content)
         if isinstance(parsed, dict):
             return parsed
-    except Exception:
+    except Exception as e:
+        print(f"LLM Call Failed or Timed Out: {e}") 
         return None
 
     return None
@@ -794,7 +810,7 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
     if len(candidates) == 0:
         candidates = movies.copy()
 
-    ranked = rank_candidates(preferences, candidates, top_k=8)
+    ranked = rank_candidates(preferences, candidates, top_k=5)
     if len(ranked) == 0:
         ranked = candidates.head(8).copy()
 
