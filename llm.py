@@ -1,13 +1,6 @@
 """
-TODO: This is the file you should edit.
-
-get_recommendation() is called once per request with the user's input.
-It should return a dict with keys "tmdb_id" and "description".
-
-IMPORTANT: Do NOT hard-code your API key in this file. The grader will supply
-its own OLLAMA_API_KEY environment variable when running your submission. Your
-code must read it from the environment (os.environ or os.getenv), not from a
-string literal in the source.
+Agentic Movie Recommender
+Modified to return movie details and concise descriptions for UI display.
 """
 
 import json
@@ -15,6 +8,7 @@ import os
 import time
 import argparse
 import re
+import concurrent.futures
 from functools import lru_cache
 from difflib import SequenceMatcher, get_close_matches
 
@@ -157,11 +151,10 @@ GENRE_VOCAB = list(GENRE_HINTS.keys()) + [
 
 
 def normalize_text(s: str) -> str:
+    """Converts text to lowercase and removes special characters, but keeps hyphens."""
     s = str(s).lower().strip()
-    s = s.replace("&", " and ")
-    s = re.sub(r"[^a-z0-9\s\-:]", " ", s)
-    s = re.sub(r"\s+", " ", s)
-    return s
+    s = re.sub(r"[^a-z0-9\s\-]", " ", s)  # 這裡加了 \- 保留連字號
+    return re.sub(r"\s+", " ", s)
 
 
 def apply_typo_fixes(text: str) -> str:
@@ -375,8 +368,9 @@ def extract_preference_signals(preferences: str) -> dict:
     for pat in director_patterns:
         m = re.search(pat, text)
         if m:
-            signals["director"] = m.group(1).strip()
-            signals["required_terms"].add(signals["director"])
+            candidate = m.group(1).strip()
+            signals["director"] = candidate
+            signals["required_terms"].add(candidate)
             break
 
     for holiday, terms in HOLIDAY_TERMS.items():
@@ -486,90 +480,156 @@ def apply_hard_constraints(movies: pd.DataFrame, signals: dict) -> pd.DataFrame:
 
     return constrained
 
-
 def score_movie(signals: dict, row) -> float:
-    genres = str(row.genres).lower() if pd.notna(row.genres) else ""
-    blob = movie_metadata_blob(row)
-
+    """
+    Scores a movie based on n-gram overlap, STRICT year matching, adult themes, and nationality mapping.
+    """
+    prompt_clean = signals.get("text", "")
+    prompt_normalized = prompt_clean.replace(" s", "s").replace("'s", "s")
+    
+    blob = str(row.get('_search_blob', ''))
+    
+    # [CRITICAL FIX 1]: Create a string combining ALL column values in the row to catch hidden data
+    # like 'production_countries' or 'original_language' that might not be in the search blob.
+    full_row_text = " ".join([str(val).lower() for val in row.values])
+    
     score = 0.0
+    
+    # ==========================================
+    # 1. BULLETPROOF Year & Decade Parsing
+    # ==========================================
+    movie_year_str = str(row.get("year", ""))
+    movie_year = 0
+    if movie_year_str.replace('.', '').isdigit():
+        movie_year = int(float(movie_year_str))
 
-    term_hits = 0
-    for term in signals["required_terms"]:
-        if normalize_text(term) in blob:
-            term_hits += 1
-    score += term_hits * 2.0
+    has_year_constraint = False
+    year_matched = False
 
-    for genre in signals["preferred_genres"]:
-        if genre in genres:
-            score += 4.0
+    if movie_year > 0:
+        range_match = re.search(r"\b(19\d{2}|20\d{2})\s*(?:-|to|and|until)\s*(19\d{2}|20\d{2})\b", prompt_normalized)
+        decade_match = re.search(r"\b(early|mid|late)?\s*(19|20)?(\d)0s\b", prompt_normalized)
+        exact_match = re.search(r"\b(19\d{2}|20\d{2})\b", prompt_normalized)
 
-    for genre in signals["avoid_genres"]:
-        if genre in genres:
-            score -= 6.0
+        if range_match:
+            has_year_constraint = True
+            start, end = int(range_match.group(1)), int(range_match.group(2))
+            start, end = min(start, end), max(start, end)
+            if start <= movie_year <= end:
+                year_matched = True
+                score += 100.0 
+                
+        elif decade_match:
+            has_year_constraint = True
+            prefix = decade_match.group(1) or ""
+            century = decade_match.group(2)
+            decade_digit = decade_match.group(3)
+            
+            base_century = century if century else ("20" if int(decade_digit) < 5 else "19")
+            base_year = int(f"{base_century}{decade_digit}0")
 
-    if signals["franchise"] == "marvel":
-        if row_matches_any_term(row, FRANCHISE_TERMS["marvel"]):
-            score += 10.0
-        else:
-            score -= 8.0
+            if prefix == "early":
+                year_matched = (base_year <= movie_year <= base_year + 3)
+            elif prefix == "mid":
+                year_matched = (base_year + 3 <= movie_year <= base_year + 6)
+            elif prefix == "late":
+                year_matched = (base_year + 6 <= movie_year <= base_year + 9)
+            else:
+                year_matched = (base_year <= movie_year <= base_year + 9)
 
-    if signals["franchise"] == "pixar":
-        if row_matches_any_term(row, FRANCHISE_TERMS["pixar"]):
-            score += 8.0
-        else:
-            score -= 4.0
+            if year_matched:
+                score += 100.0
+                
+        elif exact_match:
+            has_year_constraint = True
+            if int(exact_match.group(1)) == movie_year:
+                year_matched = True
+                score += 100.0
 
-    if signals["franchise"] == "disney":
-        if row_matches_any_term(row, FRANCHISE_TERMS["disney"]):
-            score += 8.0
-        else:
-            score -= 4.0
+    # ⭐ THE KILL SWITCH ⭐
+    if has_year_constraint and not year_matched:
+        score -= 2000.0  
 
-    if signals["actor"]:
-        if normalize_text(signals["actor"]) in blob:
-            score += 12.0
-        else:
-            score -= 6.0
+    # ==========================================
+    # 2. Nationality & Culture Mapping (FIXED)
+    # ==========================================
+    country_synonyms = {
+        "chinese": ["china", "hong kong", "taiwan", "mandarin", "cantonese", "beijing"],
+        "japanese": ["japan", "tokyo", "anime", "kyoto"],
+        "korean": ["korea", "seoul", "busan"],
+        "french": ["france", "paris", "french"],
+        "british": ["uk", "united kingdom", "london", "britain", "england"],
+        "english": ["uk", "united kingdom", "london", "britain", "england"],
+        "indian": ["india", "bollywood", "hindi", "mumbai"],
+        "spanish": ["spain", "mexico", "madrid", "barcelona"],
+        "italian": ["italy", "rome", "milan"],
+        "german": ["germany", "berlin"]
+    }
+    
+    for nat, locations in country_synonyms.items():
+        if nat in prompt_normalized:
+            for loc in locations:
+                # Search in the FULL row text, not just the blob
+                if loc in full_row_text:
+                    score += 150.0  # Massive boost to ensure it surfaces
 
-    if signals["director"]:
-        if normalize_text(signals["director"]) in blob:
-            score += 12.0
-        else:
-            score -= 6.0
+    # ==========================================
+    # 3. Adult & Steamy Themes Mapping
+    # ==========================================
+    genre_synonyms = {
+        "funny": "comedy", "hilarious": "comedy",
+        "scary": "horror", "creepy": "horror",
+        "sad": "drama", "emotional": "drama",
+        "exciting": "action", "fast": "action",
+        "love": "romance", "romantic": "romance",
+        "sci fi": "science fiction", "space": "science fiction",
+        "porn": "romance", "hot": "romance", "sexy": "romance", 
+        "steamy": "romance", "erotic": "thriller"
+    }
+    
+    adult_keywords = ["porn", "hot", "sexy", "steamy", "erotic"]
+    if any(word in prompt_normalized for word in adult_keywords):
+        target_vibes = ["affair", "seduction", "erotic", "sex", "desire", "passion", "sensual"]
+        for vibe in target_vibes:
+            if vibe in blob:
+                score += 15.0  
 
-    if "breakup" in signals["situation"]:
-        if "romance" in genres or "drama" in genres:
-            score += 5.0
-        if any(x in blob for x in ["love", "relationship", "loss", "heart", "grief", "healing"]):
-            score += 3.0
-        if "comedy" in genres:
-            score -= 2.0
+    # ==========================================
+    # 4. Standard N-gram & Keyword Boosting
+    # ==========================================
+    tokens = prompt_normalized.split()
+    extended_tokens = list(tokens)
+    for word, genre in genre_synonyms.items():
+        if word in tokens:
+            extended_tokens.append(genre)
 
-    if "celebration" in signals["situation"]:
-        if "comedy" in genres or "romance" in genres or "animation" in genres:
-            score += 2.5
-        if any(x in blob for x in ["party", "family", "wedding", "celebration", "joy"]):
-            score += 2.0
+    # 1-gram
+    for t in extended_tokens:
+        if len(t) > 3 and t in blob:
+            score += 1.0
+            
+    # 2-gram (Actor names like "Emma Stone")
+    for i in range(len(tokens) - 1):
+        bigram = f"{tokens[i]} {tokens[i+1]}"
+        if len(bigram) > 4 and bigram in blob:
+            score += 80.0  
+            
+    # 3-gram
+    for i in range(len(tokens) - 2):
+        trigram = f"{tokens[i]} {tokens[i+1]} {tokens[i+2]}"
+        if len(trigram) > 6 and trigram in blob:
+            score += 120.0 
 
-    if signals["weather"] == "rain":
-        if any(x in blob for x in ["rain", "storm", "melancholy", "moody", "lonely"]):
-            score += 3.0
-
-    if signals["season"] == "winter":
-        if any(x in blob for x in ["winter", "snow", "holiday", "christmas"]):
-            score += 3.0
-
-    if signals["holiday"] == "christmas":
-        if row_matches_any_term(row, HOLIDAY_TERMS["christmas"]):
-            score += 5.0
-
-    vote = float(row.vote_average) if pd.notna(row.vote_average) else 0.0
-    pop = float(row.popularity) if pd.notna(row.popularity) else 0.0
+    # Base weights
+    vote = float(row.get("vote_average", 0.0)) if pd.notna(row.get("vote_average")) else 0.0
+    popularity = float(row.get("popularity", 0.0)) if pd.notna(row.get("popularity")) else 0.0
+    
     score += vote * 0.5
-    score += pop * 0.01
-
+    # The popularity acts as a perfect tie-breaker. If Emma and Adam both get +80, 
+    # Cruella's higher popularity will make it rank higher than Hotel Transylvania!
+    score += popularity * 0.01
+    
     return score
-
 
 def rank_candidates(preferences: str, movies: pd.DataFrame, top_k: int = 8) -> pd.DataFrame:
     signals = extract_preference_signals(preferences)
@@ -591,10 +651,13 @@ def build_candidate_block(candidates: pd.DataFrame) -> str:
         year = getattr(row, "year", "")
         genres = str(row.genres) if pd.notna(row.genres) else ""
         vote = getattr(row, "vote_average", "")
+        
+        cast_info = getattr(row, "top_cast", getattr(row, "cast", ""))
+        cast_str = str(cast_info) if pd.notna(cast_info) else "Unknown"
 
         lines.append(
             f'- tmdb_id={int(row.tmdb_id)} | "{row.title}" ({year}) | '
-            f'genres: {genres} | rating: {vote} | overview: {overview}'
+            f'cast: {cast_str} | genres: {genres} | rating: {vote} | overview: {overview}'
         )
     return "\n".join(lines)
 
@@ -616,19 +679,15 @@ Movies already watched:
 {history_text}
 
 Choose exactly ONE movie from the candidate list below.
-Prioritize the movie that best matches the user's exact request, mood, and named entities.
-If the user mentions a franchise like Marvel, strongly prefer a movie clearly related to that franchise.
-If the user mentions an actor or director, strongly prioritize a movie matching that person.
-Only choose a tmdb_id that appears in the candidate list.
-Do not recommend anything already watched.
+The candidates are already sorted by how well they match the user's prompt and their overall popularity.
 
 Return ONLY valid JSON in this exact format:
 {{
   "tmdb_id": 123,
-  "reason": "one short sentence"
+  "description": "Your 2-3 sentence explanation here following the critical rules."
 }}
 
-Candidate movies:
+Candidate movies (ordered by best match and popularity):
 {candidate_block}
 """
 
@@ -652,8 +711,9 @@ Candidate movies:
 
 
 def clean_description(text: str) -> str:
+    """Cleans the text for display, removing quotes and fixing whitespace."""
     if not text:
-        return "A strong pick with broad appeal, memorable storytelling, and a style that fits what you're looking for."
+        return "A great choice that matches your mood and specific interests."
 
     text = text.replace("\n", " ").strip()
     text = re.sub(r"\s+", " ", text)
@@ -661,55 +721,25 @@ def clean_description(text: str) -> str:
     if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
         text = text[1:-1].strip()
 
-    if len(text) > 500:
-        text = text[:497].rstrip() + "..."
-
     return text
 
 
 def fallback_description(preferences: str, chosen_row) -> str:
+    """Generates a concise 2-sentence description for fallback scenarios."""
     signals = extract_preference_signals(preferences)
-
     title = str(chosen_row.title)
     genres = str(chosen_row.genres) if pd.notna(chosen_row.genres) else "varied genres"
-    overview = str(chosen_row.overview) if pd.notna(chosen_row.overview) else ""
-    overview = overview.replace("\n", " ").strip()
 
-    if len(overview) > 130:
-        overview = overview[:127].rstrip() + "..."
-
-    prompt_link = ""
-    if signals["actor"]:
-        prompt_link = f"Since you asked for {signals['actor']}, this connects directly to that actor request."
-    elif signals["director"]:
-        prompt_link = f"Since you wanted something tied to {signals['director']}, this is aligned with that director cue."
-    elif signals["franchise"] == "marvel":
-        prompt_link = "Since you specifically asked for Marvel, this stays in that franchise lane instead of drifting into something random."
-    elif signals["franchise"]:
-        prompt_link = f"Since you mentioned {signals['franchise']}, this stays much closer to that lane."
-    elif signals["holiday"]:
-        prompt_link = f"You mentioned {signals['holiday']}, so this is aimed at that seasonal or celebratory vibe."
-    elif signals["season"]:
-        prompt_link = f"This fits the {signals['season']} mood you mentioned."
+    if signals["franchise"] == "marvel":
+        reason = "Since you're looking for Marvel, this fits perfectly into that universe with high-stakes action."
+    elif signals["actor"]:
+        reason = f"This is a top-tier choice featuring {signals['actor']}, exactly as you requested."
     elif signals["weather"] == "rain":
-        prompt_link = "This matches the rainy, moody atmosphere in your prompt."
-    elif "breakup" in signals["situation"]:
-        prompt_link = "Because you mentioned a breakup, this leans more into emotional relevance than a generic pick."
-    elif "celebration" in signals["situation"]:
-        prompt_link = "Because your prompt suggests celebration energy, this aims for a more fitting upbeat or communal vibe."
+        reason = "This film captures the rainy, atmospheric mood from your prompt perfectly."
     else:
-        matched_terms = [t for t in list(signals["required_terms"])[:4] if normalize_text(t) in movie_metadata_blob(chosen_row)]
-        if matched_terms:
-            prompt_link = f"It connects back to your prompt through details like {', '.join(matched_terms[:3])}."
-        else:
-            prompt_link = "This is meant to feel tied to the mood and keywords in your prompt, not just broadly popular."
+        reason = f"This {genres} pick aligns with the mood and details found in your request."
 
-    desc = (
-        f"{prompt_link} {title} blends {genres} with a setup that makes it a relevant choice here: "
-        f"{overview}"
-    )
-
-    return clean_description(desc)
+    return f"{reason} It’s an engaging experience that makes for a great watch tonight."
 
 
 def choose_best_fallback(candidates: pd.DataFrame):
@@ -748,23 +778,11 @@ def emergency_random_pick(candidates: pd.DataFrame) -> dict:
     pool = candidates.head(min(5, len(candidates)))
     chosen = pool.sample(n=1).iloc[0]
 
-    title = str(chosen.title)
-    genres = str(chosen.genres) if pd.notna(chosen.genres) else "mixed genres"
-    overview = str(chosen.overview) if pd.notna(chosen.overview) else ""
-    overview = overview.replace("\n", " ").strip()
-
-    if len(overview) > 120:
-        overview = overview[:117].rstrip() + "..."
-
-    description = (
-        f"I used a fast backup pick to stay within the time limit. "
-        f"{title} is a flexible choice from the stronger candidates, with {genres} elements and a clear hook: {overview} "
-        f"If you want something more specifically tailored, try a slightly simpler prompt."
-    )
-
     return {
         "tmdb_id": int(chosen.tmdb_id),
-        "description": clean_description(description),
+        "title": str(chosen.title),
+        "year": str(getattr(chosen, "year", "")),
+        "description": "I picked a fast backup option to stay within the time limit. This highly-rated film fits the general style of your prompt.",
     }
 
 
@@ -776,20 +794,11 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
     if len(candidates) == 0:
         candidates = movies.copy()
 
-    if time_exceeded(start_time):
-        return emergency_random_pick(candidates)
-
     ranked = rank_candidates(preferences, candidates, top_k=8)
     if len(ranked) == 0:
         ranked = candidates.head(8).copy()
 
-    if time_exceeded(start_time):
-        return emergency_random_pick(ranked)
-
     llm_choice = choose_movie_with_llm(preferences, history, ranked, start_time)
-
-    if time_exceeded(start_time):
-        return emergency_random_pick(ranked)
 
     chosen_row = None
     valid_ids = set(int(x) for x in ranked["tmdb_id"].tolist())
@@ -812,77 +821,38 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
             if not movie_conflicts_with_history(row, history, history_ids):
                 chosen_row = row
                 break
-
-    if time_exceeded(start_time):
-        return emergency_random_pick(ranked)
-
-    description = fallback_description(preferences, chosen_row)
-
+    # Construct the final response with name and year
     result = {
         "tmdb_id": int(chosen_row.tmdb_id),
-        "description": clean_description(description),
+        "title": str(chosen_row.title),
+        "year": str(getattr(chosen_row, "year", "")),
+        "description": clean_description(llm_choice.get("description")) if llm_choice else fallback_description(preferences, chosen_row),
     }
 
     return result
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Run a local movie recommendation test."
-    )
-    parser.add_argument(
-        "--preferences",
-        type=str,
-        help="User preferences text. If omitted, you will be prompted.",
-    )
-    parser.add_argument(
-        "--history",
-        type=str,
-        help='Comma-separated watch history titles. Example: "The Avengers, Up"',
-    )
-    parser.add_argument(
-        "--history_ids",
-        type=str,
-        help='Comma-separated TMDB ids. Example: "299536,862"',
-    )
+    parser = argparse.ArgumentParser(description="Run a local movie recommendation test.")
+    parser.add_argument("--preferences", type=str)
+    parser.add_argument("--history", type=str)
+    parser.add_argument("--history_ids", type=str)
     args = parser.parse_args()
 
-    print("Movie recommender – type your preferences and press Enter.")
-    print("For watch history, enter comma-separated movie titles (or leave blank).")
-
-    preferences = (
-        args.preferences.strip()
-        if args.preferences and args.preferences.strip()
-        else input("Preferences: ").strip()
-    )
-    history_raw = (
-        args.history.strip()
-        if args.history and args.history.strip()
-        else input("Watch history (optional): ").strip()
-    )
-    history_ids_raw = (
-        args.history_ids.strip()
-        if args.history_ids and args.history_ids.strip()
-        else input("Watch history TMDB ids (optional): ").strip()
-    )
+    preferences = args.preferences.strip() if args.preferences else input("What are you in the mood for?: ").strip()
+    history_raw = args.history.strip() if args.history else input("Watch History (optional, comma-separated): ").strip()
+    history_ids_raw = args.history_ids.strip() if args.history_ids else input("Watch History IDs (optional, comma-separated): ").strip()
 
     history = [t.strip() for t in history_raw.split(",") if t.strip()] if history_raw else []
-
-    history_ids = []
-    if history_ids_raw:
-        for x in history_ids_raw.split(","):
-            x = x.strip()
-            if not x:
-                continue
-            try:
-                history_ids.append(int(x))
-            except ValueError:
-                pass
+    history_ids = [int(x.strip()) for x in history_ids_raw.split(",") if x.strip().isdigit()]
 
     print("\nThinking...\n")
     start = time.perf_counter()
     result = get_recommendation(preferences, history, history_ids)
-    print(result)
+    
+    # Fancy local print output
+    print(f"Recommended: {result['title']} ({result['year']})")
+    print(f"Description: {result['description']}")
+    
     elapsed = time.perf_counter() - start
-
     print(f"\nServed in {elapsed:.2f}s")
